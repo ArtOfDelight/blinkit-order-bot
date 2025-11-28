@@ -10,8 +10,8 @@ from google.cloud import vision
 from google.oauth2 import service_account
 from google.api_core.exceptions import ResourceExhausted 
 import google.generativeai as genai
-from telegram import Bot, Update
-from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
+from telegram import Update
+from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from telegram.error import BadRequest # Explicitly import BadRequest for clarity
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -33,8 +33,8 @@ TAB_NAME_ALLOWANCE = "Blinkit Transactions jatin"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY1")  # Try both env vars
 
 # === Bot Initialization ===
-updater = Updater(token=BLINKIT_BOT_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
+# Application will be initialized in main
+application = None
 
 # === Global Google Sheets Client ===
 try:
@@ -341,7 +341,7 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
         return False, None
 
 # === Message Handlers ===
-def handle_start(update: Update, context):
+async def handle_start(update: Update, context):
     """Handle /start command"""
     user_name = update.message.from_user.first_name or update.message.from_user.username or "there"
 
@@ -354,7 +354,7 @@ def handle_start(update: Update, context):
 
 No registration needed - just send:
 • Blinkit orders
-• Instamart orders  
+• Instamart orders
 • Any grocery delivery screenshots
 
 The bot will automatically:
@@ -368,33 +368,33 @@ That's it! Simple. 😊
 ✨ Works in groups too!
 """
 
-    update.message.reply_text(welcome_msg, parse_mode='Markdown')
+    await update.message.reply_text(welcome_msg, parse_mode='Markdown')
 
-def handle_photo(update: Update, context):
+async def handle_photo(update: Update, context):
     """Handle photo messages - automatically process Blinkit screenshots"""
     user = update.message.from_user
     user_id = user.id
     user_first_name = user.first_name or ""
     user_username = user.username or ""
     user_display_name = user_first_name or user_username or f"User_{user_id}"
-    
+
     chat_type = update.effective_chat.type  # 'private', 'group', or 'supergroup'
 
     try:
-        processing_msg = update.message.reply_text("⏳ Processing your order...")
+        processing_msg = await update.message.reply_text("⏳ Processing your order...")
 
         photo = update.message.photo[-1]
         print(f"Photo from {user_display_name}, file_size: {photo.file_size}")
 
         # Check file size before downloading (10MB limit)
         if photo.file_size > 10 * 1024 * 1024:
-            processing_msg.edit_text("❌ Image too large (max 10MB allowed).")
+            await processing_msg.edit_text("❌ Image too large (max 10MB allowed).")
             return
 
-        file = photo.get_file()
-        image_bytes = file.download_as_bytearray()
+        file = await photo.get_file()
+        image_bytes = await file.download_as_bytearray()
 
-        processing_msg.edit_text("⏳ Extracting order details with AI...")
+        await processing_msg.edit_text("⏳ Extracting order details with AI...")
 
         # Use AI extraction
         result = extract_order_details_with_ai(bytes(image_bytes))
@@ -402,7 +402,7 @@ def handle_photo(update: Update, context):
         # Check for quota error specifically
         if isinstance(result, dict) and result.get("error") == "quota_exceeded":
             retry_after = result.get("retry_after", 30)
-            processing_msg.edit_text(
+            await processing_msg.edit_text(
                 f"⚠️ *API Quota Exceeded*\n\n"
                 f"The Gemini AI quota has been reached. This usually resets quickly on the free tier.\n\n"
                 f"Please try again in about {int(retry_after)} seconds.\n\n"
@@ -410,9 +410,9 @@ def handle_photo(update: Update, context):
                 parse_mode='Markdown'
             )
             return
-        
+
         if not result or "total_amount" not in result:
-            processing_msg.edit_text(
+            await processing_msg.edit_text(
                 "❌ Could not extract order details from the image.\n\n"
                 "💡 Tips:\n"
                 "• Make sure the image is clear and not blurry\n"
@@ -428,7 +428,7 @@ def handle_photo(update: Update, context):
         handling_charge = result.get("handling_charge", 0)
         total_charges = delivery_charge + handling_charge
 
-        processing_msg.edit_text("⏳ Saving to sheet...")
+        await processing_msg.edit_text("⏳ Saving to sheet...")
 
         # Get current date and time
         now = datetime.datetime.now(INDIA_TZ)
@@ -484,9 +484,9 @@ def handle_photo(update: Update, context):
                 f"\nSend another screenshot to submit another order!"
             ])
 
-            processing_msg.edit_text("\n".join(confirmation), parse_mode='Markdown')
+            await processing_msg.edit_text("\n".join(confirmation), parse_mode='Markdown')
         else:
-            processing_msg.edit_text(
+            await processing_msg.edit_text(
                 "❌ Error saving to sheet. Please try again or contact admin.\n\n"
                 "You can send the screenshot again to retry."
             )
@@ -497,41 +497,41 @@ def handle_photo(update: Update, context):
         import traceback
         traceback.print_exc()
         try:
-            update.message.reply_text(
+            await update.message.reply_text(
                 "❌ Error formatting the confirmation message. Please contact admin.\n\n"
                 "Your order may have still been saved."
             )
         except Exception:
              pass
-             
+
     except Exception as e:
         print(f"Error processing order: {e}")
         import traceback
         traceback.print_exc()
         # Fallback error message
         try:
-            update.message.reply_text(
+            await update.message.reply_text(
                 "❌ Critical error processing image. Please try again or contact admin.\n\n"
                 "You can send the screenshot again to retry."
             )
         except Exception:
              pass # Failsafe
 
-def handle_text(update: Update, context):
+async def handle_text(update: Update, context):
     """Handle text messages"""
-    update.message.reply_text(
+    await update.message.reply_text(
         "📸 Please send a screenshot of your Blinkit/Instamart order.\n\n"
         "I can only process images/screenshots, not text messages."
     )
 
-def setup_handlers():
+def setup_handlers(app):
     """Setup message handlers"""
     # Command handlers
-    dispatcher.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("start", handle_start))
 
     # Message handlers - process photos automatically
-    dispatcher.add_handler(MessageHandler(Filters.photo, handle_photo))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
 # === Main Entry Point ===
 if __name__ == "__main__":
@@ -540,11 +540,14 @@ if __name__ == "__main__":
     print("- Each item saved as separate row")
     print("- Extracts delivery & handling charges")
     print("- Only captures Telegram name (no username/ID)")
-    setup_handlers()
+
+    # Build the application
+    application = Application.builder().token(BLINKIT_BOT_TOKEN).build()
+
+    setup_handlers(application)
     print("Bot handlers configured")
     print("Ready to process Blinkit/Instamart order screenshots automatically.")
     print("Press Ctrl+C to stop the bot.")
 
     # Start polling for updates
-    updater.start_polling()
-    updater.idle()
+    application.run_polling()
