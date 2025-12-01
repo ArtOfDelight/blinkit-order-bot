@@ -135,6 +135,11 @@ def extract_order_details_with_ai(image_bytes, max_retries=5):
             prompt = """
 You are analyzing a food delivery or grocery order screenshot (Blinkit, Instamart, Swiggy, etc.).
 
+This could be:
+- Order confirmation screen (shows grand total at bottom)
+- Order details/items screen (shows items grouped by category with "Summary" and "Items" tabs)
+- Receipt/invoice screen
+
 CRITICAL: Extract ONLY the information that is CLEARLY VISIBLE in the image. DO NOT guess or make up any numbers.
 
 Please extract the following information and return it as a JSON object:
@@ -146,7 +151,7 @@ Please extract the following information and return it as a JSON object:
   "items": [
     {
       "name": "<item name>",
-      "quantity": "<quantity with unit, e.g., '8 x 500g' or '4'>",
+      "quantity": "<quantity with unit, e.g., '2 x 960g' or 'Quantity: 6'>",
       "price": <final price in rupees as a number>
     }
   ]
@@ -154,14 +159,27 @@ Please extract the following information and return it as a JSON object:
 
 STRICT Rules:
 1. For total_amount: Extract the EXACT FINAL/GRAND TOTAL amount shown (not item total, MRP, or subtotal)
+   - Look for labels like "Total", "Grand Total", "To Pay", "Bill Total"
+   - If on Items tab with category subtotals, sum all category totals to get grand total
 2. DO NOT round numbers - extract EXACTLY as shown (e.g., if it says 94, return 94, NOT 100)
 3. For items: Extract ALL ordered items with their EXACT quantities and EXACT FINAL prices (after discounts)
+   - Items may be grouped under categories like "Snacks & Branded Foods", "Bakery, Cakes & Dairy" - extract ALL items from ALL categories
+   - Item format: Brand name + Product name (e.g., "BRITANNIA Nutrichoice Digestive High-Fibre Biscuits")
+   - Look for "Quantity: X" labels for quantity information
+   - Price is the rupee amount shown next to each item (final price after discounts)
 4. For delivery_charge: Extract exact amount. If it says "FREE" or "₹0", return 0
 5. For handling_charge: Extract exact amount. If it says "FREE" or "₹0", return 0
-6. If quantity has units (g, kg, ml, etc.), include them exactly as shown
-7. Clean up item names (remove checkmarks, extra symbols)
+6. If quantity has units (g, kg, ml, L, etc.), include them exactly as shown
+   - Examples: "2 x 960g", "6 x 500ml", "Quantity: 1"
+7. Clean up item names (remove checkmarks, extra symbols, but keep brand names)
 8. Return ONLY valid JSON, no additional text
 9. If you're unsure about any number, return an error instead of guessing
+
+EXAMPLES of what to extract:
+- "BRITANNIA Nutrichoice Digestive High-Fibre Biscuits 960g ₹161.96 Quantity: 1"
+  → {"name": "BRITANNIA Nutrichoice Digestive High-Fibre Biscuits", "quantity": "1 x 960g", "price": 161.96}
+- "NANDINI GoodLife Toned Milk 500ml ₹186 Quantity: 6"
+  → {"name": "NANDINI GoodLife Toned Milk", "quantity": "6 x 500ml", "price": 186}
 
 If you cannot extract the information with certainty, return:
 {"error": "Could not extract order details"}
