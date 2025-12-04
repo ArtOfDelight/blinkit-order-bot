@@ -10,8 +10,8 @@ from google.cloud import vision
 from google.oauth2 import service_account
 from google.api_core.exceptions import ResourceExhausted 
 import google.generativeai as genai
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, ConversationHandler, filters
 from telegram.error import BadRequest # Explicitly import BadRequest for clarity
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -31,6 +31,9 @@ CREDS_FILE = "service_account.json"
 ALLOWANCE_SHEET_ID = "1lQYE49QXPw4al7rSZMnaMKUytGckYYd85nico-D_weE"
 TAB_NAME_ALLOWANCE = "Blinkit Transactions jatin"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY1")  # Try both env vars
+
+# === Conversation States ===
+WAITING_FOR_PAYMENT_METHOD = 1
 
 # === Bot Initialization ===
 # Application will be initialized in main
@@ -291,26 +294,27 @@ def generate_order_id():
     # Format: ORD-YYYYMMDD-HHMMSS
     return f"ORD-{now.strftime('%Y%m%d-%H%M%S')}"
 
-def save_blinkit_items(telegram_name, items, total_charges, order_date, order_time):
+def save_blinkit_items(telegram_name, items, total_charges, order_date, order_time, payment_from):
     """
     Save each item as a separate row in Google Sheets with same Order ID
-    
+
     Args:
         telegram_name: Name of telegram user
         items: List of item dictionaries with name, quantity, price
         total_charges: Sum of delivery + handling charges
         order_date: Date string
         order_time: Time string
+        payment_from: Payment method selected by user
     """
     try:
         sheet = client.open_by_key(ALLOWANCE_SHEET_ID).worksheet(TAB_NAME_ALLOWANCE)
 
         headers = sheet.row_values(1)
-        expected_headers = ["Order ID", "Date", "Time", "Telegram Name", "Item Name", 
-                           "Quantity", "Price", "Charges", "Order Type"]
+        expected_headers = ["Order ID", "Date", "Time", "Telegram Name", "Item Name",
+                           "Quantity", "Price", "Charges", "Order Type", "Payment from"]
 
-        if not headers or len(headers) < 9:
-            sheet.update('A1:I1', [expected_headers])
+        if not headers or len(headers) < 10:
+            sheet.update('A1:J1', [expected_headers])
 
         # Generate unique order ID for this screenshot
         order_id = generate_order_id()
@@ -337,7 +341,8 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
                 item_qty,
                 item_price,
                 total_charges,  # All items get the same charges
-                "Blinkit"
+                "Blinkit",
+                payment_from  # Payment method
             ]
             rows_to_insert.append(row_data)
         
@@ -379,6 +384,7 @@ The bot will automatically:
 ✅ Extract total amount
 ✅ Extract all items with prices
 ✅ Extract delivery & handling charges
+✅ Ask you to select payment method
 ✅ Save each item as separate row in Google Sheets
 
 That's it! Simple. 😊
@@ -446,68 +452,48 @@ async def handle_photo(update: Update, context):
         handling_charge = result.get("handling_charge", 0)
         total_charges = delivery_charge + handling_charge
 
-        await processing_msg.edit_text("⏳ Saving to sheet...")
-
         # Get current date and time
         now = datetime.datetime.now(INDIA_TZ)
         order_date = now.strftime("%Y-%m-%d")
         order_time = now.strftime("%H:%M:%S")
 
-        success, order_id = save_blinkit_items(
-            user_display_name,
-            items,
-            total_charges,
-            order_date,
-            order_time
+        # Store extracted data in context for later use
+        context.user_data['pending_order'] = {
+            'user_display_name': user_display_name,
+            'items': items,
+            'total_charges': total_charges,
+            'total_amount': total_amount,
+            'delivery_charge': delivery_charge,
+            'handling_charge': handling_charge,
+            'order_date': order_date,
+            'order_time': order_time,
+            'now': now,
+            'chat_type': chat_type
+        }
+
+        # Create inline keyboard with payment options
+        keyboard = [
+            [InlineKeyboardButton("Nishat Personal", callback_data="payment_Nishat Personal")],
+            [InlineKeyboardButton("Nishat Company Card", callback_data="payment_Nishat Company Card")],
+            [InlineKeyboardButton("Kim Company Card", callback_data="payment_Kim Company Card")],
+            [InlineKeyboardButton("Kim Petty cash", callback_data="payment_Kim Petty cash")],
+            [InlineKeyboardButton("Ajay personal", callback_data="payment_Ajay personal")],
+            [InlineKeyboardButton("Ajay Company", callback_data="payment_Ajay Company")],
+            [InlineKeyboardButton("Ayaaz personal", callback_data="payment_Ayaaz personal")],
+            [InlineKeyboardButton("Ayaaz Company", callback_data="payment_Ayaaz Company")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Ask user to select payment method
+        await processing_msg.edit_text(
+            f"✅ Order extracted successfully!\n\n"
+            f"💰 Total Amount: ₹{total_amount:.2f}\n"
+            f"🛒 Items: {len(items)}\n\n"
+            f"Please select the payment method:",
+            reply_markup=reply_markup
         )
 
-        if success:
-            # --- Apply Markdown Escaping to User Data ---
-            escaped_display_name = escape_markdown_v1(user_display_name)
-            
-            # Add user context in group chats
-            user_tag = ""
-            if chat_type in ['group', 'supergroup']:
-                user_tag = f"📱 Submitted by: {escaped_display_name}\n\n"
-
-            confirmation = [
-                f"✅ Order recorded successfully!\n",
-                user_tag,
-                f"🆔 *Order ID: {order_id}*",
-                f"💰 *Total Amount: ₹{total_amount:.2f}*",
-            ]
-
-            if total_charges > 0:
-                confirmation.append(f"📦 *Charges: ₹{total_charges:.2f}* (Delivery: ₹{delivery_charge:.2f} + Handling: ₹{handling_charge:.2f})")
-            else:
-                confirmation.append(f"📦 *Charges: FREE* 🎉")
-
-            if items:
-                confirmation.append(f"\n🛒 *Items Saved ({len(items)} items):*")
-                for item in items[:8]:
-                    # --- Apply Markdown Escaping to Item Name ---
-                    item_name = escape_markdown_v1(item.get('name', 'Unknown'))
-                    item_qty = item.get('quantity', '1')
-                    item_price = item.get('price', 0)
-                    confirmation.append(f"  • {item_qty} x {item_name} - ₹{item_price:.2f}")
-                if len(items) > 8:
-                    confirmation.append(f"  ... and {len(items) - 8} more items")
-            else:
-                confirmation.append(f"\n⚠️ Note: Could not extract item details.")
-
-            confirmation.extend([
-                f"\n📅 {now.strftime('%d %b %Y')}",
-                f"⏰ {now.strftime('%I:%M %p')}",
-                f"\n✨ Each item saved as separate row",
-                f"\nSend another screenshot to submit another order!"
-            ])
-
-            await processing_msg.edit_text("\n".join(confirmation), parse_mode='Markdown')
-        else:
-            await processing_msg.edit_text(
-                "❌ Error saving to sheet. Please try again or contact admin.\n\n"
-                "You can send the screenshot again to retry."
-            )
+        return WAITING_FOR_PAYMENT_METHOD
 
     except BadRequest as e:
         # Catch the specific Telegram parsing error for cleaner output
@@ -535,6 +521,100 @@ async def handle_photo(update: Update, context):
         except Exception:
              pass # Failsafe
 
+async def handle_payment_selection(update: Update, context):
+    """Handle payment method selection"""
+    query = update.callback_query
+    await query.answer()
+
+    # Extract payment method from callback data
+    payment_method = query.data.replace("payment_", "")
+
+    # Retrieve stored order data
+    pending_order = context.user_data.get('pending_order')
+
+    if not pending_order:
+        await query.edit_message_text("❌ Session expired. Please send the screenshot again.")
+        return ConversationHandler.END
+
+    # Extract all the stored data
+    user_display_name = pending_order['user_display_name']
+    items = pending_order['items']
+    total_charges = pending_order['total_charges']
+    total_amount = pending_order['total_amount']
+    delivery_charge = pending_order['delivery_charge']
+    handling_charge = pending_order['handling_charge']
+    order_date = pending_order['order_date']
+    order_time = pending_order['order_time']
+    now = pending_order['now']
+    chat_type = pending_order['chat_type']
+
+    # Update message to show saving status
+    await query.edit_message_text("⏳ Saving to sheet...")
+
+    # Save to sheet with payment method
+    success, order_id = save_blinkit_items(
+        user_display_name,
+        items,
+        total_charges,
+        order_date,
+        order_time,
+        payment_method
+    )
+
+    if success:
+        # --- Apply Markdown Escaping to User Data ---
+        escaped_display_name = escape_markdown_v1(user_display_name)
+
+        # Add user context in group chats
+        user_tag = ""
+        if chat_type in ['group', 'supergroup']:
+            user_tag = f"📱 Submitted by: {escaped_display_name}\n\n"
+
+        confirmation = [
+            f"✅ Order recorded successfully!\n",
+            user_tag,
+            f"🆔 *Order ID: {order_id}*",
+            f"💰 *Total Amount: ₹{total_amount:.2f}*",
+            f"💳 *Payment Method: {payment_method}*",
+        ]
+
+        if total_charges > 0:
+            confirmation.append(f"📦 *Charges: ₹{total_charges:.2f}* (Delivery: ₹{delivery_charge:.2f} + Handling: ₹{handling_charge:.2f})")
+        else:
+            confirmation.append(f"📦 *Charges: FREE* 🎉")
+
+        if items:
+            confirmation.append(f"\n🛒 *Items Saved ({len(items)} items):*")
+            for item in items[:8]:
+                # --- Apply Markdown Escaping to Item Name ---
+                item_name = escape_markdown_v1(item.get('name', 'Unknown'))
+                item_qty = item.get('quantity', '1')
+                item_price = item.get('price', 0)
+                confirmation.append(f"  • {item_qty} x {item_name} - ₹{item_price:.2f}")
+            if len(items) > 8:
+                confirmation.append(f"  ... and {len(items) - 8} more items")
+        else:
+            confirmation.append(f"\n⚠️ Note: Could not extract item details.")
+
+        confirmation.extend([
+            f"\n📅 {now.strftime('%d %b %Y')}",
+            f"⏰ {now.strftime('%I:%M %p')}",
+            f"\n✨ Each item saved as separate row",
+            f"\nSend another screenshot to submit another order!"
+        ])
+
+        await query.edit_message_text("\n".join(confirmation), parse_mode='Markdown')
+    else:
+        await query.edit_message_text(
+            "❌ Error saving to sheet. Please try again or contact admin.\n\n"
+            "You can send the screenshot again to retry."
+        )
+
+    # Clear pending order data
+    context.user_data.pop('pending_order', None)
+
+    return ConversationHandler.END
+
 async def handle_text(update: Update, context):
     """Handle text messages"""
     await update.message.reply_text(
@@ -547,8 +627,19 @@ def setup_handlers(app):
     # Command handlers
     app.add_handler(CommandHandler("start", handle_start))
 
-    # Message handlers - process photos automatically
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Conversation handler for photo processing with payment method selection
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.PHOTO, handle_photo)],
+        states={
+            WAITING_FOR_PAYMENT_METHOD: [
+                CallbackQueryHandler(handle_payment_selection, pattern="^payment_")
+            ],
+        },
+        fallbacks=[],
+        allow_reentry=True
+    )
+
+    app.add_handler(conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
 # === Main Entry Point ===
