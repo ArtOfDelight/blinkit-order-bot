@@ -312,10 +312,12 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
 
         headers = sheet.row_values(1)
         expected_headers = ["Order ID", "Date", "Time", "Telegram Name", "Item Name",
-                           "Quantity", "Price", "Charges", "Order Type", "Payment from"]
+                           "Quantity", "Price", "Charges", "Order Type", "Payment from", "Category"]
 
-        if not headers or len(headers) < 10:
-            sheet.update('A1:J1', [expected_headers])
+        # Only update headers if they're missing or incomplete
+        # Allow for extra columns that may be added manually
+        if not headers or len(headers) < 11:
+            sheet.update('A1:K1', [expected_headers])
 
         # Generate unique order ID for this screenshot
         order_id = generate_order_id()
@@ -343,7 +345,8 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
                 item_price,
                 total_charges,  # All items get the same charges
                 "Blinkit",
-                payment_from  # Payment method
+                payment_from,  # Payment method
+                ""  # Category (empty for bot entries, can be filled manually)
             ]
             rows_to_insert.append(row_data)
         
