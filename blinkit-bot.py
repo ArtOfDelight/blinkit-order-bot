@@ -33,7 +33,8 @@ TAB_NAME_ALLOWANCE = "Blinkit Transactions jatin"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY1")  # Try both env vars
 
 # === Conversation States ===
-WAITING_FOR_PAYMENT_METHOD = 1
+WAITING_FOR_MANUAL_AMOUNT = 1
+WAITING_FOR_PAYMENT_METHOD = 2
 
 # === Bot Initialization ===
 # Application will be initialized in main
@@ -425,26 +426,45 @@ async def handle_photo(update: Update, context):
 
         # Check for quota error specifically
         if isinstance(result, dict) and result.get("error") == "quota_exceeded":
+            # Store basic info for manual entry
+            now = datetime.datetime.now(INDIA_TZ)
+            context.user_data['manual_entry'] = {
+                'user_display_name': user_display_name,
+                'order_date': now.strftime("%Y-%m-%d"),
+                'order_time': now.strftime("%H:%M:%S"),
+                'now': now,
+                'chat_type': chat_type
+            }
+
             retry_after = result.get("retry_after", 30)
             await processing_msg.edit_text(
                 f"⚠️ *API Quota Exceeded*\n\n"
-                f"The Gemini AI quota has been reached. This usually resets quickly on the free tier.\n\n"
-                f"Please try again in about {int(retry_after)} seconds.\n\n"
-                f"💡 If this persists, contact the developer to check the API plan.",
+                f"The Gemini AI quota has been reached. You can either:\n"
+                f"• Wait {int(retry_after)} seconds and send the screenshot again\n"
+                f"• Or enter the total amount manually now\n\n"
+                f"Please enter the total amount (numbers only):\n"
+                f"Example: 450 or 450.50",
                 parse_mode='Markdown'
             )
-            return
+            return WAITING_FOR_MANUAL_AMOUNT
 
         if not result or "total_amount" not in result:
+            # Store basic info for manual entry
+            now = datetime.datetime.now(INDIA_TZ)
+            context.user_data['manual_entry'] = {
+                'user_display_name': user_display_name,
+                'order_date': now.strftime("%Y-%m-%d"),
+                'order_time': now.strftime("%H:%M:%S"),
+                'now': now,
+                'chat_type': chat_type
+            }
+
             await processing_msg.edit_text(
-                "❌ Could not extract order details from the image.\n\n"
-                "💡 Tips:\n"
-                "• Make sure the image is clear and not blurry\n"
-                "• Ensure the final total amount is clearly visible\n"
-                "• Try taking the screenshot again\n\n"
-                "Send a new screenshot to try again!"
+                "⚠️ Could not extract order details from the image.\n\n"
+                "Please enter the total amount manually (numbers only):\n"
+                "Example: 450 or 450.50"
             )
-            return
+            return WAITING_FOR_MANUAL_AMOUNT
 
         total_amount = result["total_amount"]
         items = result.get("items", [])
@@ -520,6 +540,72 @@ async def handle_photo(update: Update, context):
             )
         except Exception:
              pass # Failsafe
+
+async def handle_manual_amount(update: Update, context):
+    """Handle manually entered amount when AI extraction fails"""
+    user_input = update.message.text.strip()
+
+    # Validate input is a number
+    try:
+        total_amount = float(user_input)
+        if total_amount <= 0:
+            await update.message.reply_text(
+                "❌ Please enter a valid positive amount.\n"
+                "Example: 450 or 450.50"
+            )
+            return WAITING_FOR_MANUAL_AMOUNT
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid amount. Please enter numbers only.\n"
+            "Example: 450 or 450.50"
+        )
+        return WAITING_FOR_MANUAL_AMOUNT
+
+    # Retrieve stored manual entry data
+    manual_entry = context.user_data.get('manual_entry')
+    if not manual_entry:
+        await update.message.reply_text("❌ Session expired. Please send the screenshot again.")
+        return ConversationHandler.END
+
+    # Store the amount and prepare for payment method selection
+    context.user_data['pending_order'] = {
+        'user_display_name': manual_entry['user_display_name'],
+        'items': [{'name': 'not processed', 'quantity': '1', 'price': total_amount}],
+        'total_charges': 0,
+        'total_amount': total_amount,
+        'delivery_charge': 0,
+        'handling_charge': 0,
+        'order_date': manual_entry['order_date'],
+        'order_time': manual_entry['order_time'],
+        'now': manual_entry['now'],
+        'chat_type': manual_entry['chat_type'],
+        'manual_entry': True  # Flag to indicate this was manual
+    }
+
+    # Clear manual entry data
+    context.user_data.pop('manual_entry', None)
+
+    # Create inline keyboard with payment options
+    keyboard = [
+        [InlineKeyboardButton("Nishat Personal", callback_data="payment_Nishat Personal")],
+        [InlineKeyboardButton("Nishat Company Card", callback_data="payment_Nishat Company Card")],
+        [InlineKeyboardButton("Kim Company Card", callback_data="payment_Kim Company Card")],
+        [InlineKeyboardButton("Kim Petty cash", callback_data="payment_Kim Petty cash")],
+        [InlineKeyboardButton("Ajay personal", callback_data="payment_Ajay personal")],
+        [InlineKeyboardButton("Ajay Company", callback_data="payment_Ajay Company")],
+        [InlineKeyboardButton("Ayaaz personal", callback_data="payment_Ayaaz personal")],
+        [InlineKeyboardButton("Ayaaz Company", callback_data="payment_Ayaaz Company")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Ask user to select payment method
+    await update.message.reply_text(
+        f"✅ Amount received: ₹{total_amount:.2f}\n\n"
+        f"Please select the payment method:",
+        reply_markup=reply_markup
+    )
+
+    return WAITING_FOR_PAYMENT_METHOD
 
 async def handle_payment_selection(update: Update, context):
     """Handle payment method selection"""
@@ -631,6 +717,9 @@ def setup_handlers(app):
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.PHOTO, handle_photo)],
         states={
+            WAITING_FOR_MANUAL_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_amount)
+            ],
             WAITING_FOR_PAYMENT_METHOD: [
                 CallbackQueryHandler(handle_payment_selection, pattern="^payment_")
             ],
