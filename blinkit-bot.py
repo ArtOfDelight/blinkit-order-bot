@@ -32,6 +32,11 @@ ALLOWANCE_SHEET_ID = "1lQYE49QXPw4al7rSZMnaMKUytGckYYd85nico-D_weE"
 TAB_NAME_ALLOWANCE = "Blinkit Transactions jatin"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY1")  # Try both env vars
 
+# === Order Type Identifier Mapping ===
+ORDER_TYPE_IDENTIFIERS = {
+    "sri ganeshaya namaha": "Prem Marketing",
+}
+
 # === Conversation States ===
 WAITING_FOR_MANUAL_AMOUNT = 1
 WAITING_FOR_PAYMENT_METHOD = 2
@@ -136,6 +141,17 @@ def extract_order_details_with_ai(image_bytes, max_retries=5):
             image = Image.open(io.BytesIO(image_bytes))
 
             # Create prompt for Blinkit/Instamart orders with charges extraction
+            # Build identifier detection instructions
+            identifier_instructions = ""
+            if ORDER_TYPE_IDENTIFIERS:
+                identifier_list = []
+                for identifier, order_type in ORDER_TYPE_IDENTIFIERS.items():
+                    identifier_list.append(f'   - If you find "{identifier}" (case-insensitive) -> set "order_type": "{order_type}"')
+                identifier_instructions = "\n10. IDENTIFIER DETECTION:\n" + \
+                    "   Check the FIRST FEW ROWS/LINES of the image for these text identifiers:\n" + \
+                    "\n".join(identifier_list) + \
+                    '\n   - If NONE found, set "order_type": "Blinkit"\n   - Match is case-insensitive'
+
             prompt = """
 You are analyzing a food delivery or grocery order screenshot (Blinkit, Instamart, Swiggy, etc.).
 
@@ -149,6 +165,7 @@ CRITICAL: Extract ONLY the information that is CLEARLY VISIBLE in the image. DO 
 Please extract the following information and return it as a JSON object:
 
 {
+  "order_type": "<detected order type from identifiers or Blinkit>",
   "total_amount": <final total amount in rupees as a number>,
   "delivery_charge": <delivery charge in rupees as a number, 0 if free>,
   "handling_charge": <handling charge in rupees as a number, 0 if free>,
@@ -178,6 +195,7 @@ STRICT Rules:
 7. Clean up item names (remove checkmarks, extra symbols, but keep brand names)
 8. Return ONLY valid JSON, no additional text
 9. If you're unsure about any number, return an error instead of guessing
+""" + identifier_instructions + """
 
 EXAMPLES of what to extract:
 - "BRITANNIA Nutrichoice Digestive High-Fibre Biscuits 960g ₹161.96 Quantity: 1"
@@ -225,14 +243,19 @@ If you cannot extract the information with certainty, return:
             # Ensure items list exists
             if "items" not in result:
                 result["items"] = []
-            
+
             # Ensure charges exist with default 0
             if "delivery_charge" not in result:
                 result["delivery_charge"] = 0
             if "handling_charge" not in result:
                 result["handling_charge"] = 0
 
+            # Ensure order_type exists with default "Blinkit"
+            if "order_type" not in result:
+                result["order_type"] = "Blinkit"
+
             print(f"✅ AI Extraction completed")
+            print(f"   Order Type: {result['order_type']}")
             print(f"   Final Amount: ₹{result['total_amount']}")
             print(f"   Delivery Charge: ₹{result['delivery_charge']}")
             print(f"   Handling Charge: ₹{result['handling_charge']}")
@@ -295,7 +318,7 @@ def generate_order_id():
     # Format: ORD-YYYYMMDD-HHMMSS
     return f"ORD-{now.strftime('%Y%m%d-%H%M%S')}"
 
-def save_blinkit_items(telegram_name, items, total_charges, order_date, order_time, payment_from):
+def save_blinkit_items(telegram_name, items, total_charges, order_date, order_time, payment_from, order_type="Blinkit"):
     """
     Save each item as a separate row in Google Sheets with same Order ID
 
@@ -306,6 +329,7 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
         order_date: Date string
         order_time: Time string
         payment_from: Payment method selected by user
+        order_type: Order type/supplier name (default: "Blinkit")
     """
     try:
         sheet = client.open_by_key(ALLOWANCE_SHEET_ID).worksheet(TAB_NAME_ALLOWANCE)
@@ -344,7 +368,7 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
                 item_qty,
                 item_price,
                 total_charges,  # All items get the same charges
-                "Blinkit",
+                order_type,  # Detected order type from AI
                 payment_from,  # Payment method
                 ""  # Category (empty for bot entries, can be filled manually)
             ]
@@ -474,6 +498,7 @@ async def handle_photo(update: Update, context):
         delivery_charge = result.get("delivery_charge", 0)
         handling_charge = result.get("handling_charge", 0)
         total_charges = delivery_charge + handling_charge
+        order_type = result.get("order_type", "Blinkit")
 
         # Get current date and time
         now = datetime.datetime.now(INDIA_TZ)
@@ -488,6 +513,7 @@ async def handle_photo(update: Update, context):
             'total_amount': total_amount,
             'delivery_charge': delivery_charge,
             'handling_charge': handling_charge,
+            'order_type': order_type,
             'order_date': order_date,
             'order_time': order_time,
             'now': now,
@@ -578,6 +604,7 @@ async def handle_manual_amount(update: Update, context):
         'total_amount': total_amount,
         'delivery_charge': 0,
         'handling_charge': 0,
+        'order_type': 'Blinkit',  # Default for manual entries
         'order_date': manual_entry['order_date'],
         'order_time': manual_entry['order_time'],
         'now': manual_entry['now'],
@@ -632,6 +659,7 @@ async def handle_payment_selection(update: Update, context):
     total_amount = pending_order['total_amount']
     delivery_charge = pending_order['delivery_charge']
     handling_charge = pending_order['handling_charge']
+    order_type = pending_order.get('order_type', 'Blinkit')
     order_date = pending_order['order_date']
     order_time = pending_order['order_time']
     now = pending_order['now']
@@ -640,14 +668,15 @@ async def handle_payment_selection(update: Update, context):
     # Update message to show saving status
     await query.edit_message_text("⏳ Saving to sheet...")
 
-    # Save to sheet with payment method
+    # Save to sheet with payment method and order type
     success, order_id = save_blinkit_items(
         user_display_name,
         items,
         total_charges,
         order_date,
         order_time,
-        payment_method
+        payment_method,
+        order_type
     )
 
     if success:
