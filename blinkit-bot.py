@@ -5,6 +5,7 @@ import json
 from PIL import Image
 import io
 import time # Added time import for sleep
+import asyncio
 from zoneinfo import ZoneInfo
 from google.cloud import vision
 from google.oauth2 import service_account
@@ -40,6 +41,7 @@ ORDER_TYPE_IDENTIFIERS = {
 # === Conversation States ===
 WAITING_FOR_MANUAL_AMOUNT = 1
 WAITING_FOR_PAYMENT_METHOD = 2
+WAITING_FOR_MORE_PHOTOS = 3
 
 # === Bot Initialization ===
 # Application will be initialized in main
@@ -124,21 +126,30 @@ def extract_text_from_image(image_bytes):
 # === AI Extraction Functions ===
 def extract_order_details_with_ai(image_bytes, max_retries=5):
     """
-    Use Google Gemini AI to extract Blinkit order details from image
+    Use Google Gemini AI to extract Blinkit order details from one or more images
+    Args:
+        image_bytes: Either a single bytes object or a list of bytes objects
     Returns: dict with 'total_amount', 'items', 'delivery_charge', 'handling_charge'
     """
-    
+
     # Check if the model is initialized before entering the loop
     if not gemini_model:
         print("⚠️ Gemini AI not available")
         return None
 
+    # Ensure we have a list (backwards compatibility with single image)
+    if isinstance(image_bytes, bytes):
+        image_bytes_list = [image_bytes]
+    else:
+        image_bytes_list = image_bytes
+
     for attempt in range(max_retries):
         try:
             print(f"\n=== AI EXTRACTION STARTED (Attempt {attempt + 1}/{max_retries}) ===")
+            print(f"Processing {len(image_bytes_list)} screenshot(s)")
 
-            # Convert bytes to PIL Image
-            image = Image.open(io.BytesIO(image_bytes))
+            # Convert all bytes to PIL Images
+            images = [Image.open(io.BytesIO(img_bytes)) for img_bytes in image_bytes_list]
 
             # Create prompt for Blinkit/Instamart orders with charges extraction
             # Build identifier detection instructions
@@ -153,14 +164,25 @@ def extract_order_details_with_ai(image_bytes, max_retries=5):
                     '\n   - If NONE found, set "order_type": "Blinkit"\n   - Match is case-insensitive'
 
             prompt = """
-You are analyzing a food delivery or grocery order screenshot (Blinkit, Instamart, Swiggy, etc.).
+You are analyzing one or more food delivery or grocery order screenshots (Blinkit, Instamart, Swiggy, etc.).
 
-This could be:
+IMPORTANT: You may receive MULTIPLE screenshots for the SAME order. This happens when:
+- The items list is long and requires scrolling
+- Some screenshots show the top items, others show items after scrolling down
+- Some screenshots show the bill details/totals at the bottom
+
+Each screenshot could be:
 - Order confirmation screen (shows grand total at bottom)
 - Order details/items screen (shows items grouped by category with "Summary" and "Items" tabs)
 - Receipt/invoice screen
+- Continuation of items list (scrolled down)
 
-CRITICAL: Extract ONLY the information that is CLEARLY VISIBLE in the image. DO NOT guess or make up any numbers.
+CRITICAL: If you receive multiple screenshots, COMBINE the information from ALL of them:
+- Merge ALL items from ALL screenshots (remove duplicates if any)
+- Use the bill details/total from whichever screenshot contains it
+- This is ONE order split across multiple screenshots
+
+DO NOT guess or make up any numbers. Only extract what is CLEARLY VISIBLE across all screenshots.
 
 Please extract the following information and return it as a JSON object:
 
@@ -207,9 +229,10 @@ If you cannot extract the information with certainty, return:
 {"error": "Could not extract order details"}
 """
 
-            # Generate content with AI
+            # Generate content with AI - pass prompt + all images
             print("Extracting with Gemini AI...")
-            response = gemini_model.generate_content([prompt, image])
+            content = [prompt] + images
+            response = gemini_model.generate_content(content)
 
             print(f"AI Response received")
             print(f"Response text: {response.text[:500]}")
@@ -422,6 +445,42 @@ That's it! Simple. 😊
 
     await update.message.reply_text(welcome_msg, parse_mode='Markdown')
 
+async def handle_multi(update: Update, context):
+    """Handle /multi command - start multi-screenshot collection mode"""
+    user_name = update.message.from_user.first_name or "there"
+
+    # Initialize screenshots collection
+    context.user_data['screenshots'] = []
+    context.user_data['multi_mode'] = True
+    context.user_data['user_display_name'] = user_name
+    context.user_data['chat_type'] = update.effective_chat.type
+
+    await update.message.reply_text(
+        f"📸 *Multi-Screenshot Mode Activated*\n\n"
+        f"Send multiple screenshots of the same order (for long orders with many items).\n\n"
+        f"After sending all screenshots, click *Process All Screenshots* to combine them into one order.\n\n"
+        f"💡 Tip: Take screenshots of different parts of the same order (top, middle, bottom)",
+        parse_mode='Markdown'
+    )
+
+    return WAITING_FOR_MORE_PHOTOS
+
+async def handle_reset(update: Update, context):
+    """Handle /reset command - cancel current operation and clear data"""
+    # Clear all user data
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "🔄 *Reset Complete*\n\n"
+        "All data cleared. You can now:\n"
+        "• Send a single screenshot for instant processing\n"
+        "• Use /multi for multiple screenshots\n"
+        "• Use /start to see the welcome message",
+        parse_mode='Markdown'
+    )
+
+    return ConversationHandler.END
+
 async def handle_photo(update: Update, context):
     """Handle photo messages - automatically process Blinkit screenshots"""
     user = update.message.from_user
@@ -432,6 +491,52 @@ async def handle_photo(update: Update, context):
 
     chat_type = update.effective_chat.type  # 'private', 'group', or 'supergroup'
 
+    # Check if we're in multi-screenshot mode
+    if context.user_data.get('multi_mode'):
+        # Multi-screenshot collection mode
+        try:
+            processing_msg = await update.message.reply_text("⏳ Downloading screenshot...")
+
+            photo = update.message.photo[-1]
+            print(f"[MULTI MODE] Photo {len(context.user_data.get('screenshots', [])) + 1} from {user_display_name}, file_size: {photo.file_size}")
+
+            # Check file size before downloading (10MB limit)
+            if photo.file_size > 10 * 1024 * 1024:
+                await processing_msg.edit_text("❌ Image too large (max 10MB allowed).")
+                return WAITING_FOR_MORE_PHOTOS
+
+            file = await photo.get_file()
+            image_bytes = await file.download_as_bytearray()
+
+            # Add to screenshots collection
+            context.user_data['screenshots'].append(bytes(image_bytes))
+            num_screenshots = len(context.user_data['screenshots'])
+
+            # Create inline keyboard
+            keyboard = [
+                [InlineKeyboardButton("➕ Add More Screenshots", callback_data="add_more_screenshots")],
+                [InlineKeyboardButton("✅ Process All Screenshots", callback_data="process_all_screenshots")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await processing_msg.edit_text(
+                f"📸 *Screenshot {num_screenshots} received!*\n\n"
+                f"Total screenshots collected: {num_screenshots}\n\n"
+                f"Choose an option:",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
+            return WAITING_FOR_MORE_PHOTOS
+
+        except Exception as e:
+            print(f"Error in multi-screenshot mode: {e}")
+            import traceback
+            traceback.print_exc()
+            await update.message.reply_text("❌ Error processing screenshot. Use /reset to start over.")
+            return WAITING_FOR_MORE_PHOTOS
+
+    # Single screenshot mode (existing behavior - unchanged)
     try:
         processing_msg = await update.message.reply_text("⏳ Processing your order...")
 
@@ -637,6 +742,159 @@ async def handle_manual_amount(update: Update, context):
 
     return WAITING_FOR_PAYMENT_METHOD
 
+async def handle_add_more_screenshots(update: Update, context):
+    """Handle 'Add More Screenshots' button callback"""
+    query = update.callback_query
+    await query.answer()
+
+    num_screenshots = len(context.user_data.get('screenshots', []))
+
+    await query.edit_message_text(
+        f"📸 *Ready for more screenshots!*\n\n"
+        f"Currently have: {num_screenshots} screenshot(s)\n\n"
+        f"Send the next screenshot of the same order.",
+        parse_mode='Markdown'
+    )
+
+    return WAITING_FOR_MORE_PHOTOS
+
+async def handle_process_all_screenshots(update: Update, context):
+    """Handle 'Process All Screenshots' button - combine and extract data from all screenshots"""
+    query = update.callback_query
+    await query.answer()
+
+    screenshots = context.user_data.get('screenshots', [])
+    user_display_name = context.user_data.get('user_display_name', 'Unknown')
+    chat_type = context.user_data.get('chat_type', 'private')
+
+    if not screenshots:
+        await query.edit_message_text("❌ No screenshots found. Please send screenshots first.")
+        return ConversationHandler.END
+
+    try:
+        await query.edit_message_text(
+            f"⏳ *Processing {len(screenshots)} screenshot(s)...*\n\n"
+            f"Combining all items into one order. This may take a moment...",
+            parse_mode='Markdown'
+        )
+
+        print(f"\n=== PROCESSING {len(screenshots)} SCREENSHOTS ===")
+
+        # Run AI extraction in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, extract_order_details_with_ai, screenshots)
+
+        print(f"AI extraction completed! Result: {result is not None}")
+
+        # Clear multi mode and screenshots
+        context.user_data.pop('multi_mode', None)
+        context.user_data.pop('screenshots', None)
+
+        # Check for quota error
+        if isinstance(result, dict) and result.get("error") == "quota_exceeded":
+            now = datetime.datetime.now(INDIA_TZ)
+            context.user_data['manual_entry'] = {
+                'user_display_name': user_display_name,
+                'order_date': now.strftime("%Y-%m-%d"),
+                'order_time': now.strftime("%H:%M:%S"),
+                'now': now,
+                'chat_type': chat_type
+            }
+
+            retry_after = result.get("retry_after", 30)
+            await query.edit_message_text(
+                f"⚠️ *API Quota Exceeded*\n\n"
+                f"The Gemini AI quota has been reached. You can either:\n"
+                f"• Wait {int(retry_after)} seconds and try again\n"
+                f"• Or enter the total amount manually now\n\n"
+                f"Please enter the total amount (numbers only):\n"
+                f"Example: 450 or 450.50",
+                parse_mode='Markdown'
+            )
+            return WAITING_FOR_MANUAL_AMOUNT
+
+        # Check if extraction failed
+        if not result or "total_amount" not in result:
+            now = datetime.datetime.now(INDIA_TZ)
+            context.user_data['manual_entry'] = {
+                'user_display_name': user_display_name,
+                'order_date': now.strftime("%Y-%m-%d"),
+                'order_time': now.strftime("%H:%M:%S"),
+                'now': now,
+                'chat_type': chat_type
+            }
+
+            await query.edit_message_text(
+                "⚠️ Could not extract order details from the screenshots.\n\n"
+                "Please enter the total amount manually (numbers only):\n"
+                "Example: 450 or 450.50"
+            )
+            return WAITING_FOR_MANUAL_AMOUNT
+
+        # Extract order details
+        total_amount = result["total_amount"]
+        items = result.get("items", [])
+        delivery_charge = result.get("delivery_charge", 0)
+        handling_charge = result.get("handling_charge", 0)
+        total_charges = delivery_charge + handling_charge
+        order_type = result.get("order_type", "Blinkit")
+
+        now = datetime.datetime.now(INDIA_TZ)
+        order_date = now.strftime("%Y-%m-%d")
+        order_time = now.strftime("%H:%M:%S")
+
+        # Store extracted data
+        context.user_data['pending_order'] = {
+            'user_display_name': user_display_name,
+            'items': items,
+            'total_charges': total_charges,
+            'total_amount': total_amount,
+            'delivery_charge': delivery_charge,
+            'handling_charge': handling_charge,
+            'order_type': order_type,
+            'order_date': order_date,
+            'order_time': order_time,
+            'now': now,
+            'chat_type': chat_type
+        }
+
+        # Create payment options keyboard
+        keyboard = [
+            [InlineKeyboardButton("Nishat Personal", callback_data="payment_Nishat Personal")],
+            [InlineKeyboardButton("Nishat Company Card", callback_data="payment_Nishat Company Card")],
+            [InlineKeyboardButton("Kim Company Card", callback_data="payment_Kim Company Card")],
+            [InlineKeyboardButton("Kim Petty cash", callback_data="payment_Kim Petty cash")],
+            [InlineKeyboardButton("Ajay personal", callback_data="payment_Ajay personal")],
+            [InlineKeyboardButton("Ajay Company", callback_data="payment_Ajay Company")],
+            [InlineKeyboardButton("Ayaaz personal", callback_data="payment_Ayaaz personal")],
+            [InlineKeyboardButton("Ayaaz Company", callback_data="payment_Ayaaz Company")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            f"✅ *Order extracted successfully!*\n\n"
+            f"📦 Combined from {len(screenshots)} screenshot(s)\n"
+            f"💰 Total Amount: ₹{total_amount:.2f}\n"
+            f"🛒 Items: {len(items)}\n"
+            f"🚚 Order Type: {order_type}\n\n"
+            f"Please select the payment method:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+        return WAITING_FOR_PAYMENT_METHOD
+
+    except Exception as e:
+        print(f"Error processing screenshots: {e}")
+        import traceback
+        traceback.print_exc()
+        context.user_data.pop('multi_mode', None)
+        context.user_data.pop('screenshots', None)
+        await query.edit_message_text(
+            "❌ Error processing screenshots. Please use /reset and try again."
+        )
+        return ConversationHandler.END
+
 async def handle_payment_selection(update: Update, context):
     """Handle payment method selection"""
     query = update.callback_query
@@ -740,15 +998,37 @@ async def handle_text(update: Update, context):
         "I can only process images/screenshots, not text messages."
     )
 
+async def post_init(application):
+    """Set up bot commands menu"""
+    from telegram import BotCommand
+
+    commands = [
+        BotCommand("start", "Show welcome message and instructions"),
+        BotCommand("multi", "Start multi-screenshot mode for long orders"),
+        BotCommand("reset", "Cancel current operation and clear data")
+    ]
+
+    await application.bot.set_my_commands(commands)
+    print("✅ Bot commands menu configured")
+
 def setup_handlers(app):
     """Setup message handlers"""
     # Command handlers
     app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("reset", handle_reset))
 
     # Conversation handler for photo processing with payment method selection
     conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.PHOTO, handle_photo)],
+        entry_points=[
+            MessageHandler(filters.PHOTO, handle_photo),
+            CommandHandler("multi", handle_multi)
+        ],
         states={
+            WAITING_FOR_MORE_PHOTOS: [
+                MessageHandler(filters.PHOTO, handle_photo),
+                CallbackQueryHandler(handle_add_more_screenshots, pattern="^add_more_screenshots$"),
+                CallbackQueryHandler(handle_process_all_screenshots, pattern="^process_all_screenshots$")
+            ],
             WAITING_FOR_MANUAL_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_amount)
             ],
@@ -756,8 +1036,9 @@ def setup_handlers(app):
                 CallbackQueryHandler(handle_payment_selection, pattern="^payment_")
             ],
         },
-        fallbacks=[],
-        allow_reentry=True
+        fallbacks=[CommandHandler("reset", handle_reset)],
+        allow_reentry=True,
+        per_message=True
     )
 
     app.add_handler(conv_handler)
@@ -772,7 +1053,7 @@ if __name__ == "__main__":
     print("- Only captures Telegram name (no username/ID)")
 
     # Build the application
-    application = Application.builder().token(BLINKIT_BOT_TOKEN).build()
+    application = Application.builder().token(BLINKIT_BOT_TOKEN).post_init(post_init).build()
 
     setup_handlers(application)
     print("Bot handlers configured")
