@@ -458,6 +458,8 @@ async def handle_multi(update: Update, context):
     context.user_data['chat_type'] = update.effective_chat.type
 
     print(f"\n=== MULTI MODE ACTIVATED by {user_name} ===")
+    print(f"User data after /multi: multi_mode={context.user_data.get('multi_mode')}")
+    print(f"Screenshots list initialized: {len(context.user_data.get('screenshots', []))} items")
 
     await update.message.reply_text(
         f"📸 *Multi-Screenshot Mode Activated!*\n\n"
@@ -472,6 +474,9 @@ async def handle_multi(update: Update, context):
         f"Now send your first screenshot!",
         parse_mode='Markdown'
     )
+
+    # Return state to properly start the conversation
+    return WAITING_FOR_MORE_PHOTOS
 
 async def handle_reset(update: Update, context):
     """Handle /reset command - cancel current operation and clear data"""
@@ -498,6 +503,10 @@ async def handle_photo(update: Update, context):
     user_display_name = user_first_name or user_username or f"User_{user_id}"
 
     chat_type = update.effective_chat.type  # 'private', 'group', or 'supergroup'
+
+    print(f"\n=== PHOTO RECEIVED from {user_display_name} ===")
+    print(f"Multi mode active: {context.user_data.get('multi_mode', False)}")
+    print(f"Current screenshots count: {len(context.user_data.get('screenshots', []))}")
 
     # Check if we're in multi-screenshot mode
     if context.user_data.get('multi_mode'):
@@ -757,6 +766,10 @@ async def handle_add_more_screenshots(update: Update, context):
 
     num_screenshots = len(context.user_data.get('screenshots', []))
 
+    print(f"\n=== ADD MORE SCREENSHOTS BUTTON CLICKED ===")
+    print(f"Current screenshot count: {num_screenshots}")
+    print(f"Multi mode: {context.user_data.get('multi_mode', False)}")
+
     await query.edit_message_text(
         f"📸 *Ready for more screenshots!*\n\n"
         f"Currently have: {num_screenshots} screenshot(s)\n\n"
@@ -764,6 +777,7 @@ async def handle_add_more_screenshots(update: Update, context):
         parse_mode='Markdown'
     )
 
+    print(f"Returning state: WAITING_FOR_MORE_PHOTOS")
     return WAITING_FOR_MORE_PHOTOS
 
 async def handle_process_all_screenshots(update: Update, context):
@@ -775,7 +789,13 @@ async def handle_process_all_screenshots(update: Update, context):
     user_display_name = context.user_data.get('user_display_name', 'Unknown')
     chat_type = context.user_data.get('chat_type', 'private')
 
+    print(f"\n=== PROCESS ALL SCREENSHOTS BUTTON CLICKED ===")
+    print(f"Screenshot count: {len(screenshots)}")
+    print(f"User: {user_display_name}")
+    print(f"Multi mode: {context.user_data.get('multi_mode', False)}")
+
     if not screenshots:
+        print("❌ ERROR: No screenshots found in context!")
         await query.edit_message_text("❌ No screenshots found. Please send screenshots first.")
         return ConversationHandler.END
 
@@ -786,13 +806,15 @@ async def handle_process_all_screenshots(update: Update, context):
             parse_mode='Markdown'
         )
 
-        print(f"\n=== PROCESSING {len(screenshots)} SCREENSHOTS ===")
+        print(f"\n=== STARTING AI EXTRACTION FOR {len(screenshots)} SCREENSHOTS ===")
 
         # Run AI extraction in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, extract_order_details_with_ai, screenshots)
 
-        print(f"AI extraction completed! Result: {result is not None}")
+        print(f"✅ AI extraction completed! Result exists: {result is not None}")
+        if result:
+            print(f"Result keys: {result.keys()}")
 
         # Clear multi mode and screenshots
         context.user_data.pop('multi_mode', None)
@@ -1021,15 +1043,14 @@ async def post_init(application):
 
 def setup_handlers(app):
     """Setup message handlers"""
-    # Command handlers
+    # Command handlers (standalone)
     app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CommandHandler("multi", handle_multi))
-    app.add_handler(CommandHandler("reset", handle_reset))
 
     # Conversation handler for photo processing with payment method selection
     conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.PHOTO, handle_photo)
+            CommandHandler("multi", handle_multi),  # /multi starts the conversation
+            MessageHandler(filters.PHOTO, handle_photo)  # Photos also start conversation
         ],
         states={
             WAITING_FOR_MORE_PHOTOS: [
@@ -1046,7 +1067,7 @@ def setup_handlers(app):
         },
         fallbacks=[CommandHandler("reset", handle_reset)],
         allow_reentry=True,
-        per_message=True
+        per_message=False  # Changed to False for proper conversation tracking
     )
 
     app.add_handler(conv_handler)
