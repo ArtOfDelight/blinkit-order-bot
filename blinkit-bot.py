@@ -203,6 +203,7 @@ Please extract the following information and return it as a JSON object:
 STRICT Rules:
 1. For total_amount: Extract the EXACT FINAL/GRAND TOTAL amount shown (not item total, MRP, or subtotal)
    - Look for labels like "Total", "Grand Total", "To Pay", "Bill Total"
+   - If no grand total is visible but all items are visible, sum the final prices of ALL extracted items to calculate total_amount
    - If on Items tab with category subtotals, sum all category totals to get grand total
 2. DO NOT round numbers - extract EXACTLY as shown (e.g., if it says 94, return 94, NOT 100)
 3. For items: Extract ALL ordered items with their EXACT quantities and EXACT FINAL prices (after discounts)
