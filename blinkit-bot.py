@@ -447,7 +447,8 @@ That's it! Simple. 😊
 
 async def handle_multi(update: Update, context):
     """Handle /multi command - start multi-screenshot collection mode"""
-    user_name = update.message.from_user.first_name or "there"
+    user = update.message.from_user
+    user_name = user.first_name or user.username or "there"
 
     # Initialize screenshots collection
     context.user_data['screenshots'] = []
@@ -455,15 +456,21 @@ async def handle_multi(update: Update, context):
     context.user_data['user_display_name'] = user_name
     context.user_data['chat_type'] = update.effective_chat.type
 
+    print(f"\n=== MULTI MODE ACTIVATED by {user_name} ===")
+
     await update.message.reply_text(
-        f"📸 *Multi-Screenshot Mode Activated*\n\n"
+        f"📸 *Multi-Screenshot Mode Activated!*\n\n"
         f"Send multiple screenshots of the same order (for long orders with many items).\n\n"
-        f"After sending all screenshots, click *Process All Screenshots* to combine them into one order.\n\n"
-        f"💡 Tip: Take screenshots of different parts of the same order (top, middle, bottom)",
+        f"After each screenshot, you'll get buttons to:\n"
+        f"• Add more screenshots\n"
+        f"• Process all screenshots\n\n"
+        f"💡 Tip: Take screenshots of different parts of the same order:\n"
+        f"   - Top items\n"
+        f"   - Middle items (scrolled)\n"
+        f"   - Bottom with bill/total\n\n"
+        f"Now send your first screenshot!",
         parse_mode='Markdown'
     )
-
-    return WAITING_FOR_MORE_PHOTOS
 
 async def handle_reset(update: Update, context):
     """Handle /reset command - cancel current operation and clear data"""
@@ -1015,13 +1022,13 @@ def setup_handlers(app):
     """Setup message handlers"""
     # Command handlers
     app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("multi", handle_multi))
     app.add_handler(CommandHandler("reset", handle_reset))
 
     # Conversation handler for photo processing with payment method selection
     conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.PHOTO, handle_photo),
-            CommandHandler("multi", handle_multi)
+            MessageHandler(filters.PHOTO, handle_photo)
         ],
         states={
             WAITING_FOR_MORE_PHOTOS: [
