@@ -642,7 +642,72 @@ async def handle_photo(update: Update, context):
             'chat_type': chat_type
         }
 
-        # Create inline keyboard with payment options
+        # Auto-save if order type is "Prem Marketing"
+        if order_type == "Prem Marketing":
+            payment_method = "Prem Marketing"
+
+            await processing_msg.edit_text("⏳ Saving to sheet (Prem Marketing order)...")
+
+            # Save to sheet with auto-selected payment method
+            success, order_id = save_blinkit_items(
+                user_display_name,
+                items,
+                total_charges,
+                order_date,
+                order_time,
+                payment_method,
+                order_type
+            )
+
+            if success:
+                escaped_display_name = escape_markdown_v1(user_display_name)
+                user_tag = ""
+                if chat_type in ['group', 'supergroup']:
+                    user_tag = f"📱 Submitted by: {escaped_display_name}\n\n"
+
+                confirmation = [
+                    f"✅ Order recorded successfully!\n",
+                    user_tag,
+                    f"🆔 *Order ID: {order_id}*",
+                    f"💰 *Total Amount: ₹{total_amount:.2f}*",
+                    f"💳 *Payment Method: {payment_method}* (Auto-selected)",
+                ]
+
+                if total_charges > 0:
+                    confirmation.append(f"📦 *Charges: ₹{total_charges:.2f}* (Delivery: ₹{delivery_charge:.2f} + Handling: ₹{handling_charge:.2f})")
+                else:
+                    confirmation.append(f"📦 *Charges: FREE* 🎉")
+
+                if items:
+                    confirmation.append(f"\n🛒 *Items Saved ({len(items)} items):*")
+                    for item in items[:8]:
+                        item_name = escape_markdown_v1(item.get('name', 'Unknown'))
+                        item_qty = item.get('quantity', '1')
+                        item_price = item.get('price', 0)
+                        confirmation.append(f"  • {item_qty} x {item_name} - ₹{item_price:.2f}")
+                    if len(items) > 8:
+                        confirmation.append(f"  ... and {len(items) - 8} more items")
+                else:
+                    confirmation.append(f"\n⚠️ Note: Could not extract item details.")
+
+                confirmation.extend([
+                    f"\n📅 {now.strftime('%d %b %Y')}",
+                    f"⏰ {now.strftime('%I:%M %p')}",
+                    f"\n✨ Each item saved as separate row",
+                    f"\nSend another screenshot to submit another order!"
+                ])
+
+                await processing_msg.edit_text("\n".join(confirmation), parse_mode='Markdown')
+            else:
+                await processing_msg.edit_text(
+                    "❌ Error saving to sheet. Please try again or contact admin.\n\n"
+                    "You can send the screenshot again to retry."
+                )
+
+            context.user_data.pop('pending_order', None)
+            return ConversationHandler.END
+
+        # Create inline keyboard with payment options (for non-Prem Marketing orders)
         keyboard = [
             [InlineKeyboardButton("Nishat Personal", callback_data="payment_Nishat Personal")],
             [InlineKeyboardButton("Nishat Company Card", callback_data="payment_Nishat Company Card")],
@@ -888,7 +953,73 @@ async def handle_process_all_screenshots(update: Update, context):
             'chat_type': chat_type
         }
 
-        # Create payment options keyboard
+        # Auto-save if order type is "Prem Marketing"
+        if order_type == "Prem Marketing":
+            payment_method = "Prem Marketing"
+
+            await query.edit_message_text("⏳ Saving to sheet (Prem Marketing order)...")
+
+            # Save to sheet with auto-selected payment method
+            success, order_id = save_blinkit_items(
+                user_display_name,
+                items,
+                total_charges,
+                order_date,
+                order_time,
+                payment_method,
+                order_type
+            )
+
+            if success:
+                escaped_display_name = escape_markdown_v1(user_display_name)
+                user_tag = ""
+                if chat_type in ['group', 'supergroup']:
+                    user_tag = f"📱 Submitted by: {escaped_display_name}\n\n"
+
+                confirmation = [
+                    f"✅ Order recorded successfully!\n",
+                    user_tag,
+                    f"🆔 *Order ID: {order_id}*",
+                    f"📦 Combined from {len(screenshots)} screenshot(s)\n",
+                    f"💰 *Total Amount: ₹{total_amount:.2f}*",
+                    f"💳 *Payment Method: {payment_method}* (Auto-selected)",
+                ]
+
+                if total_charges > 0:
+                    confirmation.append(f"📦 *Charges: ₹{total_charges:.2f}* (Delivery: ₹{delivery_charge:.2f} + Handling: ₹{handling_charge:.2f})")
+                else:
+                    confirmation.append(f"📦 *Charges: FREE* 🎉")
+
+                if items:
+                    confirmation.append(f"\n🛒 *Items Saved ({len(items)} items):*")
+                    for item in items[:8]:
+                        item_name = escape_markdown_v1(item.get('name', 'Unknown'))
+                        item_qty = item.get('quantity', '1')
+                        item_price = item.get('price', 0)
+                        confirmation.append(f"  • {item_qty} x {item_name} - ₹{item_price:.2f}")
+                    if len(items) > 8:
+                        confirmation.append(f"  ... and {len(items) - 8} more items")
+                else:
+                    confirmation.append(f"\n⚠️ Note: Could not extract item details.")
+
+                confirmation.extend([
+                    f"\n📅 {now.strftime('%d %b %Y')}",
+                    f"⏰ {now.strftime('%I:%M %p')}",
+                    f"\n✨ Each item saved as separate row",
+                    f"\nSend another screenshot to submit another order!"
+                ])
+
+                await query.edit_message_text("\n".join(confirmation), parse_mode='Markdown')
+            else:
+                await query.edit_message_text(
+                    "❌ Error saving to sheet. Please try again or contact admin.\n\n"
+                    "You can send the screenshot again to retry."
+                )
+
+            context.user_data.pop('pending_order', None)
+            return ConversationHandler.END
+
+        # Create payment options keyboard (for non-Prem Marketing orders)
         keyboard = [
             [InlineKeyboardButton("Nishat Personal", callback_data="payment_Nishat Personal")],
             [InlineKeyboardButton("Nishat Company Card", callback_data="payment_Nishat Company Card")],
