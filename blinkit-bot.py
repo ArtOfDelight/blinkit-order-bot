@@ -336,6 +336,107 @@ If you cannot extract the information with certainty, return:
     return None # Should not reach here
 
 # === Google Sheets Functions ===
+
+# Cache for item-category mappings (refreshed periodically)
+_item_category_cache = {}
+_cache_last_updated = None
+CACHE_TTL_SECONDS = 300  # Refresh cache every 5 minutes
+
+def get_item_category_mappings():
+    """
+    Fetch all historical item-category mappings from the sheet.
+    Uses caching to avoid frequent API calls.
+    Returns: dict mapping item names (lowercase) to categories
+    """
+    global _item_category_cache, _cache_last_updated
+
+    now = datetime.datetime.now(INDIA_TZ)
+
+    # Check if cache is still valid
+    if _cache_last_updated and (now - _cache_last_updated).total_seconds() < CACHE_TTL_SECONDS:
+        return _item_category_cache
+
+    try:
+        sheet = client.open_by_key(ALLOWANCE_SHEET_ID).worksheet(TAB_NAME_ALLOWANCE)
+
+        # Get all data from the sheet
+        all_data = sheet.get_all_records()
+
+        # Build mapping: item name (lowercase) -> category
+        mappings = {}
+        for row in all_data:
+            item_name = row.get('Item Name', '').strip().lower()
+            category = row.get('Category', '').strip()
+
+            # Only store if both item name and category exist
+            if item_name and category:
+                mappings[item_name] = category
+
+        _item_category_cache = mappings
+        _cache_last_updated = now
+
+        print(f"✓ Loaded {len(mappings)} item-category mappings from history")
+        return mappings
+
+    except Exception as e:
+        print(f"Warning: Could not load category mappings: {e}")
+        return _item_category_cache  # Return stale cache if available
+
+def find_category_for_item(item_name):
+    """
+    Find the category for an item based on historical data.
+    Uses exact match first, then partial/fuzzy matching.
+
+    Args:
+        item_name: The item name to look up
+
+    Returns:
+        Category string if found, empty string otherwise
+    """
+    if not item_name:
+        return ""
+
+    mappings = get_item_category_mappings()
+    if not mappings:
+        return ""
+
+    item_lower = item_name.strip().lower()
+
+    # 1. Try exact match first
+    if item_lower in mappings:
+        print(f"  → Category match (exact): '{item_name}' -> '{mappings[item_lower]}'")
+        return mappings[item_lower]
+
+    # 2. Try partial matching (if item name contains or is contained in a known item)
+    for known_item, category in mappings.items():
+        # Check if the new item contains a known item name (or vice versa)
+        if item_lower in known_item or known_item in item_lower:
+            print(f"  → Category match (partial): '{item_name}' -> '{category}'")
+            return category
+
+    # 3. Try matching by significant words (for brand + product combos)
+    item_words = set(item_lower.split())
+    best_match = None
+    best_score = 0
+
+    for known_item, category in mappings.items():
+        known_words = set(known_item.split())
+        # Count matching words
+        common_words = item_words & known_words
+        # Require at least 2 matching words for a match
+        if len(common_words) >= 2:
+            score = len(common_words) / max(len(item_words), len(known_words))
+            if score > best_score and score >= 0.5:  # At least 50% word match
+                best_score = score
+                best_match = category
+
+    if best_match:
+        print(f"  → Category match (word-based): '{item_name}' -> '{best_match}'")
+        return best_match
+
+    # No match found
+    return ""
+
 def generate_order_id():
     """Generate unique order ID using timestamp"""
     now = datetime.datetime.now(INDIA_TZ)
@@ -372,17 +473,23 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
 
         # Prepare all rows to insert at once (more efficient)
         rows_to_insert = []
-        
+        categories_assigned = 0
+
         for item in items:
             item_name = item.get('name', 'Unknown Item')
             item_qty = item.get('quantity', '1')
             item_price = item.get('price', 0)
-            
+
             try:
                 item_price = float(item_price)
             except (TypeError, ValueError):
                 item_price = 0.0
-            
+
+            # Auto-assign category based on historical data
+            category = find_category_for_item(item_name)
+            if category:
+                categories_assigned += 1
+
             row_data = [
                 order_id,  # Same order ID for all items in this screenshot
                 order_date,
@@ -394,7 +501,7 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
                 total_charges,  # All items get the same charges
                 order_type,  # Detected order type from AI
                 payment_from,  # Payment method
-                ""  # Category (empty for bot entries, can be filled manually)
+                category  # Auto-assigned from history or empty
             ]
             rows_to_insert.append(row_data)
         
@@ -404,6 +511,7 @@ def save_blinkit_items(telegram_name, items, total_charges, order_date, order_ti
             print(f"✓ Saved {len(rows_to_insert)} items for {telegram_name}")
             print(f"  Order ID: {order_id}")
             print(f"  Total charges (delivery + handling): ₹{total_charges}")
+            print(f"  Categories auto-assigned: {categories_assigned}/{len(rows_to_insert)}")
             return True, order_id
         else:
             print(f"⚠️ No items to save for {telegram_name}")
